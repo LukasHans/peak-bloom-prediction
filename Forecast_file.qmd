@@ -1,0 +1,1158 @@
+---
+jupyter: python3
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error,mean_absolute_error, r2_score
+from sklearn.model_selection import TimeSeriesSplit, cross_val_predict, KFold, cross_val_score
+import os
+import json
+from glob import glob
+from sklearn.base import clone
+import optuna
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.svm import SVR
+from sklearn.linear_model import BayesianRidge
+```
+
+# Load flower data
+
+```{python}
+file_list = ['kyoto', 'liestal', 'nyc', 'washingtondc', 'vancouver']
+df_list = []
+
+for file_name in file_list:
+    df_list.append(pd.read_csv(f"data/{file_name}.csv"))
+
+df = pd.concat(df_list, ignore_index=True)
+```
+
+The historic data includes a dummy row for the year 2025. We included this row to make the feature engineering easier. 
+
+# Weather data
+
+From previous competitions we arlread know that adding weather information to our forecasting problem makes a difference. Therefore, we scraped historical weather information for different locations and also forecasts, for the month of march to enrich our model with this information. 
+
+```{python}
+def process_weather_data_with_advanced_features(folder_path):
+    """
+    Processes multiple weather CSV files and extracts key features for bloom prediction:
+    - Growing Degree Days (GDD) from Jan to March
+    - Warm Spell Days (>15°C in Feb-March)
+    - Temperature Trend (Mean & Std Dev from Jan to March)
+    - Temperature Variability (Nov–Jan)
+    - Cold Days (<10°C)
+    
+    Args:
+    folder_path (str): Path to the folder containing weather CSV files.
+
+    Returns:
+    pd.DataFrame: Concatenated DataFrame with processed weather data for all locations.
+    """
+
+    all_files = glob(os.path.join(folder_path, "*.csv"))
+    processed_data = []
+
+    for file in all_files:
+        # Extract location name from filename
+        location_name = os.path.basename(file).replace("_weather", "").replace("_", "/").replace(".csv", "")
+        if location_name.lower() == "nyc":
+            location_name = "newyorkcity"
+
+        # Load and process weather data
+        df_weather = pd.read_csv(file)
+        df_weather["date"] = pd.to_datetime(df_weather["date"])
+
+        # Extract year, month, and DOY
+        df_weather["year"] = df_weather["date"].dt.year
+        df_weather["month"] = df_weather["date"].dt.month
+        df_weather["DOY"] = df_weather["date"].dt.dayofyear
+
+        # Identify leap years
+        df_weather["leap_year"] = df_weather["year"].apply(lambda x: 1 if (x % 4 == 0 and x % 100 != 0) or (x % 400 == 0) else 0)
+
+        # Filter for relevant months (October to March)
+        df_weather_filtered = df_weather[df_weather["month"].isin([10, 11, 12, 1, 2])].copy()
+
+        # Shift October-December to the next year for bloom alignment
+        df_weather_filtered.loc[df_weather_filtered["month"].isin([10, 11, 12]), "year"] += 1
+
+        # Compute daily averages
+        df_daily_means = df_weather_filtered.groupby(["year", "DOY"]).agg({
+            "temperature_2m_max": "mean",
+            "temperature_2m_mean": "mean",
+            "temperature_2m_min": "mean",
+            "precipitation_sum": "mean",
+            "rain_sum": "mean"
+        }).reset_index()
+
+        # Compute count of cold days separately
+        df_cold_days = df_weather_filtered.groupby(["year", "DOY"])["temperature_2m_mean"].apply(lambda x: (x < 10).sum()).reset_index()
+        df_cold_days.rename(columns={"temperature_2m_mean": "cold_days_below_10"}, inplace=True)
+
+        # Compute temperature variability (std dev) for Nov-Jan per year-month
+        df_temp_variability = df_weather_filtered[df_weather_filtered["month"].isin([11, 12, 1,2])].groupby(["year", "month"]).agg({
+            "temperature_2m_mean": "std"
+        }).reset_index().rename(columns={"temperature_2m_mean": "temp_variability"})
+
+        # Feature 1: Growing Degree Days (GDD) - Base Temp 5°C (Jan-Mar)
+        df_weather_filtered["GDD"] = df_weather_filtered["temperature_2m_mean"].apply(lambda x: max(0, x - 5))
+        df_GDD = df_weather_filtered[df_weather_filtered["month"].isin([1, 2])].groupby("year")["GDD"].sum().reset_index().rename(columns={"GDD": "total_GDD_Jan_Mar"})
+
+        # Feature 2: Warm Spell Detection (Days > 15°C in Feb-March)
+        df_weather_filtered["warm_spell_day"] = df_weather_filtered["temperature_2m_mean"] > 15
+        df_warm_spells = df_weather_filtered[df_weather_filtered["month"].isin([1,2])].groupby("year")["warm_spell_day"].sum().reset_index().rename(columns={"warm_spell_day": "total_warm_spells_Feb_Mar"})
+
+        # Feature 3: Temperature Trend (Mean & Std from Jan to March)
+        temp_trend = df_weather_filtered[df_weather_filtered["month"].isin([1, 2])].groupby("year").agg({"temperature_2m_mean": ["mean", "std"]})
+        temp_trend.columns = ["temp_trend_mean", "temp_trend_std"]
+        temp_trend.reset_index(inplace=True)
+
+        # Merge cold day counts into daily means
+        df_daily_means = df_daily_means.merge(df_cold_days, on=["year", "DOY"], how="left")
+
+        # Ensure every (year, DOY) combination exists
+        all_years = df_weather_filtered["year"].unique()
+        valid_doys = df_weather_filtered["DOY"].unique()  # Only DOYs for Oct-Apr
+        all_doys = sorted(valid_doys)  # Sort to maintain order
+
+        full_doy_grid = pd.MultiIndex.from_product(
+            [all_years, all_doys],
+            names=["year", "DOY"]
+        ).to_frame(index=False)
+
+        # Merge to enforce a uniform structure
+        df_daily_means_full = full_doy_grid.merge(df_daily_means, on=["year", "DOY"], how="left")
+
+        # Fill missing values robustly
+        df_daily_means_full.interpolate(method="linear", inplace=True)  # Fill using trends
+        df_daily_means_full.fillna(df_daily_means_full.groupby("DOY").transform("median"), inplace=True)  # Use median where gaps exist
+        df_daily_means_full.fillna(0, inplace=True)  # Ensure no NaNs remain
+
+        # Add leap year column
+        df_daily_means_full["leap_year"] = df_daily_means_full["year"].apply(lambda x: 1 if (x % 4 == 0 and x % 100 != 0) or (x % 400 == 0) else 0)
+
+        # Pivot into a structured dataset (one row per year, columns per DOY)
+        df_pivot_doy = df_daily_means_full.pivot(index="year", columns="DOY", values=["temperature_2m_max", "temperature_2m_mean", "temperature_2m_min", "precipitation_sum", "rain_sum", "cold_days_below_10"])
+
+        # Flatten column names
+        df_pivot_doy.columns = [f"{var}_DOY{doy}" for var, doy in df_pivot_doy.columns]
+
+        # Reset index to keep "year" as a column
+        df_pivot_doy.reset_index(inplace=True)
+
+        # Add location column
+        df_pivot_doy["location"] = location_name
+
+        # Merge additional climate features
+        df_additional_features = df_GDD.merge(df_warm_spells, on="year").merge(temp_trend, on="year")
+        df_pivot_doy = df_pivot_doy.merge(df_additional_features, on="year", how="left")
+
+        # Merge temperature variability per year-month into the dataset
+        df_temp_variability_pivot = df_temp_variability.pivot(index="year", columns="month", values="temp_variability")
+        df_temp_variability_pivot.columns = [f"temp_variability_M{month}" for month in df_temp_variability_pivot.columns]
+
+        # Merge temperature variability into the final dataset
+        df_pivot_doy = df_pivot_doy.merge(df_temp_variability_pivot, on="year", how="left")
+
+        # Append to list
+        processed_data.append(df_pivot_doy)
+
+    # Concatenate all locations into a single dataframe
+    final_df = pd.concat(processed_data, ignore_index=True)
+
+    return final_df
+
+
+
+processed_weather_data = process_weather_data_with_advanced_features("weather/")
+```
+
+# Additional information: 
+
+We only look at data thats is after the year 1980. There was a nice paper that looked at the regime shift in the flower data (https://www.researchgate.net/publication/284484997_Global_impacts_of_the_1980s_regime_shift). Starting from there we also found, that the historic data beyond 2000 leads to significant worse preidctions in the later years (2022 onwards). Therefore, we cut of all data points that are earlier than the year 2000.
+Furtermore, we add no-linear featues like the squarred year to account for the accelaration effect of global warming, as well as features like log(year) ad year * lat. 
+Lastly, we added rolling values of the peak flower date. 
+
+```{python}
+# Ensure only necessary columns exist
+df_training = df[['year', 'location', 'bloom_doy', 'alt', 'lat', 'long']].dropna()
+
+
+# Convert year to numeric
+df_training['year'] = pd.to_numeric(df_training['year'], errors='coerce')
+df_training['year_squared'] = df_training['year'] ** 2
+df_training['log_year'] = np.log(df_training['year'])
+# df_training['year_lat_long'] = df_training['year'] * df_training['lat']*df_training['long']
+df_training['year_alt'] = df_training['year'] * df_training['alt']
+
+
+# Sort data by location and year for< rolling calculations
+df_training = df_training.sort_values(by=['location', 'year'])
+
+# Compute rolling averages for bloom_doy within each location
+df_training['bloom_doy_lag1'] = df_training.groupby('location')['bloom_doy'].shift(1)  # Last year's bloom day
+df_training['bloom_doy_rolling2'] = df_training.groupby('location')['bloom_doy'].shift(1).rolling(window=2, min_periods=1).mean()
+df_training['bloom_doy_rolling3'] = df_training.groupby('location')['bloom_doy'].shift(1).rolling(window=3, min_periods=1).mean()  
+df_training['bloom_doy_rolling4'] = df_training.groupby('location')['bloom_doy'].shift(1).rolling(window=4, min_periods=1).mean()
+df_training['bloom_doy_rolling5'] = df_training.groupby('location')['bloom_doy'].shift(1).rolling(window=5, min_periods=1).mean()  
+df_training['bloom_doy_rolling7'] = df_training.groupby('location')['bloom_doy'].shift(1).rolling(window=7, min_periods=1).mean() 
+df_training['bloom_doy_rolling10'] = df_training.groupby('location')['bloom_doy'].shift(1).rolling(window=10, min_periods=1).mean() 
+df_training['alt_year'] = df_training['year']*df_training['alt']
+
+df_training = df_training[df_training['year']>= 2000]
+
+nyc_mask = (df_training['location'] == 'newyorkcity') & (df_training['year'] >= 2024)
+
+
+df_training.loc[nyc_mask, 'bloom_doy_lag1'] = df_training.loc[nyc_mask, 'bloom_doy']
+
+
+df_training.loc[nyc_mask, 'bloom_doy_rolling2'] =  df_training.loc[nyc_mask, 'bloom_doy']
+
+
+df_training.loc[nyc_mask, 'bloom_doy_rolling3'] =  df_training.loc[nyc_mask, 'bloom_doy']
+
+df_training.loc[nyc_mask, 'bloom_doy_rolling4'] =  df_training.loc[nyc_mask, 'bloom_doy']
+
+
+df_training.loc[nyc_mask, 'bloom_doy_rolling5'] =  df_training.loc[nyc_mask, 'bloom_doy']
+
+
+df_training.loc[nyc_mask, 'bloom_doy_rolling7'] = df_training.loc[nyc_mask, 'bloom_doy']
+
+
+df_training.loc[nyc_mask, 'bloom_doy_rolling10'] =  df_training.loc[nyc_mask, 'bloom_doy']
+
+# Merge the flower data with the weather data
+df_training = df_training.merge(processed_weather_data, on=["year", "location"], how="left")
+```
+
+```{python}
+df_training[df_training['year']>=2025]
+```
+
+Due to the additional features that we created, we also created a lot of noise in our data. Having so many features that dont do anything can backfire and decrease the accuracy of our model prediction. 
+To keep this notebook clean we do not include the code of how we got to the number of features, but we ended up with 191. These features are the top 191 featuers of a LightGBM model ordered by its feature importance. 
+
+```{python}
+# 1. Prepare the data
+# Create dummy variables for 'location' and filter for years < 2024
+df_training_dummies = pd.get_dummies(df_training, columns=['location'], drop_first=True).dropna()
+df_training_dummies['washington_year']= df_training_dummies['year']*df_training_dummies['log_year']
+df_training_dummies_filter = df_training_dummies[df_training_dummies['year'] < 2024]
+
+# Separate features and target
+X = df_training_dummies_filter.drop(columns=['bloom_doy'])
+y = df_training_dummies_filter['bloom_doy']
+
+# 2. Optionally, scale numerical features
+
+scaler = StandardScaler()
+X_scaled_arr = scaler.fit_transform(X)
+# Convert back to DataFrame to retain column names
+X_scaled = pd.DataFrame(X_scaled_arr, columns=X.columns, index=X.index)
+
+# 3. Evaluate a LightGBM model using TimeSeriesSplit CV
+tscv = TimeSeriesSplit(n_splits=5)
+rmse_list = []
+
+print("Evaluating LightGBM model with TimeSeriesSplit:")
+for fold, (train_idx, test_idx) in enumerate(tscv.split(X_scaled), start=1):
+    X_train, X_test = X_scaled.iloc[train_idx], X_scaled.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    
+    # Define and train the LightGBM regressor
+    model = lgb.LGBMRegressor(random_state=42, verbosity = -1)
+    model.fit(X_train, y_train,
+              eval_set=[(X_test, y_test)])
+    
+    y_pred = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    rmse_list.append(rmse)
+    print(f"Fold {fold} RMSE: {rmse:.2f}")
+
+print(f"\nAverage RMSE from LightGBM (all features): {np.mean(rmse_list):.2f}\n")
+
+# 4. Train a final LightGBM model on all training data to extract feature importances
+final_model = lgb.LGBMRegressor(random_state=42, verbosity = -1)
+final_model.fit(X_scaled, y)
+feature_importances = final_model.feature_importances_
+
+
+feat_imp_df = pd.DataFrame({'feature': X_scaled.columns, 'importance': feature_importances})
+feat_imp_df = feat_imp_df.sort_values(by='importance', ascending=False)
+```
+
+# Hyperparameter tuning
+
+We started the journey with four potential models. These models are LightGBM, XGBoost, SVR, and Bayesianridge regression. To get the optimal outcome for our models, we need to tune there hyperparameters. The code block below is doing that for you but we already saved the hyperparameters as a json file. 
+
+
+```{python}
+selected_features =  feat_imp_df.head(191)['feature'].tolist()
+```
+
+```{python}
+# def tune_model_with_optuna(model_name: str,
+#                            X_train: np.ndarray, y_train: np.ndarray,
+#                            X_test: np.ndarray, y_test: np.ndarray,
+#                            n_trials: int = 50) -> dict:
+#     """
+#     Tune hyperparameters for a given model using Optuna with a fixed train-test split.
+#     Returns the best hyperparameters.
+#     """
+#     def objective(trial: optuna.Trial) -> float:
+#         if model_name == "SVR":
+#             params = {
+#                 "C": trial.suggest_float("C", 0.1, 1.0, log=True),
+#                 "epsilon": trial.suggest_float("epsilon", 0.01, 1.0),
+#                 "kernel": trial.suggest_categorical("kernel", ["linear"]),
+#             }
+#             model = SVR(**params)
+            
+#         elif model_name == "BayesianRidge":
+#             params = {
+#                 "alpha_1": trial.suggest_float("alpha_1", 1e-6, 1e-2, log=True),
+#                 "alpha_2": trial.suggest_float("alpha_2", 1e-6, 1e-2, log=True),
+#                 "lambda_1": trial.suggest_float("lambda_1", 1e-6, 1e-2, log=True),
+#                 "lambda_2": trial.suggest_float("lambda_2", 1e-6, 1e-2, log=True),
+#             }
+#             model = BayesianRidge(**params)
+            
+#         elif model_name == "LightGBM":
+#             params = {
+#                 "objective": "regression",
+#                 "metric": "rmse",
+#                 "verbosity": -1,
+#                 "boosting_type": "gbdt",
+#                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+#                 "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+#                 "max_depth": trial.suggest_int("max_depth", 3, 15),
+#                 "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+#                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10),
+#                 "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10),
+#                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9), 
+#                 "n_estimators": trial.suggest_int("n_estimators", 250, 600, step=25)
+#             }
+#             model = lgb.LGBMRegressor(**params)
+            
+#         elif model_name == "XGBoost":
+#             params = {
+#                 "n_estimators": trial.suggest_int("n_estimators", 250, 600, step=25),
+#                 "max_depth": trial.suggest_int("max_depth", 1, 20),
+#                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+#                 "gamma": trial.suggest_float("gamma", 0, 5),
+#                 "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+#                 "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+#                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
+#                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
+#                 "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True)
+#             }
+#             model = xgb.XGBRegressor(**params)
+      
+            
+#         else:
+#             return float("inf")
+        
+#         # Train on the fixed training set and evaluate on the fixed test set.
+#         model.fit(X_train, y_train)
+#         y_pred = model.predict(X_test)
+#         rmse = np.sqrt(np.mean((y_test - y_pred) ** 2))
+#         return rmse
+
+#     study = optuna.create_study(direction="minimize")
+#     study.optimize(objective, n_trials=n_trials)
+#     return study.best_params
+
+
+# def tune_and_save_hyperparams(df_training: pd.DataFrame, selected_features: list,
+#                               models_to_tune: list, n_trials: int = 50,
+#                               save_path: str = "hyperparams_feb.json") -> dict:
+#     """
+#     Tunes hyperparameters for each model in models_to_tune using a fixed train-test split,
+#     where the test set includes all rows with year >= 2022, and saves them to a JSON file.
+#     """
+#     # Split the data based on the "year" column
+#     train_df = df_training[df_training["year"] < 2023]
+#     test_df = df_training[df_training["year"] >= 2023]
+    
+#     # Select features and target variable
+#     X_train = train_df[selected_features]
+#     y_train = train_df["bloom_doy"]
+#     X_test = test_df[selected_features]
+#     y_test = test_df["bloom_doy"]
+    
+#     # Fit the scaler on training data and transform both sets
+#     scaler = StandardScaler()
+#     X_train_scaled = scaler.fit_transform(X_train)
+#     X_test_scaled = scaler.transform(X_test)
+    
+#     hyperparams = {}
+#     for model_name in models_to_tune:
+#         print(f"Tuning {model_name}...")
+#         best_params = tune_model_with_optuna(model_name, X_train_scaled, y_train,
+#                                              X_test_scaled, y_test, n_trials)
+#         print(f"Best parameters for {model_name}: {best_params}")
+#         hyperparams[model_name] = best_params
+
+
+
+#     #Save the hyperparameters to a JSON file
+#     with open(save_path, "w") as f:
+#         json.dump(hyperparams, f)
+#     return hyperparams
+
+
+
+
+# # Example usage:
+# models_to_tune = ["SVR", "BayesianRidge", "LightGBM", "XGBoost"]
+
+# # df_training_dummies_filter is your training dataframe which must contain a "year" column.
+# hyperparams = tune_and_save_hyperparams(df_training_dummies, selected_features, models_to_tune, n_trials=2500)
+
+```
+
+# Test the model 
+
+We test how good our ensemble would have predicted the outcome based on the last two years. 
+
+```{python}
+# ---------------------------
+# 1. Load hyperparameters for each branch
+# ---------------------------
+with open("hyperparams_feb.json", "r") as f:
+    hyperparams_feb = json.load(f)
+# with open(hyperparams_march_file, "r") as f:
+# hyperparams_march = json.load(f)
+
+# ---------------------------
+# 2. Prepare data and define target
+# ---------------------------
+df_training_prediction = df_training_dummies.copy()
+df_training_prediction = df_training_prediction.dropna()
+df_training_prediction = df_training_prediction[df_training_prediction['year']<2023]
+y = df_training_prediction["bloom_doy"]
+
+# ---------------------------
+# 3. Define base models (common types for both branches)
+# ---------------------------
+base_models_dict = {
+"SVR": SVR,
+"BayesianRidge": BayesianRidge,
+"LightGBM": lgb.LGBMRegressor,
+"XGBoost": xgb.XGBRegressor
+}
+
+# ---------------------------
+# 4. Build Feb ensemble
+# ---------------------------
+
+
+selected_features = feat_imp_df.head(191)['feature'].tolist()
+X_feb = df_training_prediction[selected_features]
+scaler_feb = StandardScaler()
+X_feb_scaled = scaler_feb.fit_transform(X_feb)
+
+base_models_feb = {}
+predictions_list = []
+for model_name, model_class in base_models_dict.items():
+    params = hyperparams_feb.get(model_name, {})
+    if model_name == "LightGBM":
+        params["verbosity"] = -1
+
+    model = model_class(**params)
+    model.fit(X_feb_scaled, y)
+    X_test_scaled = scaler_feb.transform(df_training_dummies[(df_training_dummies['year']>=2023)& (df_training_dummies['year']<=2024)][selected_features])
+    prediction = model.predict(X_test_scaled)
+    # print(model_name, prediction)
+    predictions_list.append(prediction)
+    rmse = (mean_absolute_error(df_training_dummies[(df_training_dummies['year']>=2023)& (df_training_dummies['year']<=2024)]['bloom_doy'], prediction))
+    print(model_name, rmse)
+
+
+ensemble_predictions = np.mean(np.vstack(predictions_list), axis=0)
+# print(ensemble_predictions)
+ensemble_mae = mean_absolute_error(df_training_dummies[(df_training_dummies['year']>=2023)& (df_training_dummies['year']<=2024)]['bloom_doy'], ensemble_predictions)
+
+
+print(f"\nEnsemble Average Prediction MAE : {ensemble_mae:.2f}")
+ 
+
+```
+
+# Preparing another scenario with information including march
+
+```{python}
+def process_weather_data_with_advanced_features(folder_path):
+    """
+    Processes multiple weather CSV files and extracts key features for bloom prediction:
+    - Growing Degree Days (GDD) from Jan to March
+    - Warm Spell Days (>15°C in Feb-March)
+    - Temperature Trend (Mean & Std Dev from Jan to March)
+    - Temperature Variability (Nov–Jan)
+    - Cold Days (<10°C)
+    
+    Args:
+    folder_path (str): Path to the folder containing weather CSV files.
+
+    Returns:
+    pd.DataFrame: Concatenated DataFrame with processed weather data for all locations.
+    """
+
+    all_files = glob(os.path.join(folder_path, "*.csv"))
+    processed_data = []
+
+    for file in all_files:
+        # Extract location name from filename
+        location_name = os.path.basename(file).replace("_weather", "").replace("_", "/").replace(".csv", "")
+        if location_name.lower() == "nyc":
+            location_name = "newyorkcity"
+
+        # Load and process weather data
+        df_weather = pd.read_csv(file)
+        df_weather["date"] = pd.to_datetime(df_weather["date"])
+
+        # Extract year, month, and DOY
+        df_weather["year"] = df_weather["date"].dt.year
+        df_weather["month"] = df_weather["date"].dt.month
+        df_weather["DOY"] = df_weather["date"].dt.dayofyear
+
+        # Identify leap years
+        df_weather["leap_year"] = df_weather["year"].apply(lambda x: 1 if (x % 4 == 0 and x % 100 != 0) or (x % 400 == 0) else 0)
+
+        # Filter for relevant months (October to March)
+        df_weather_filtered = df_weather[df_weather["month"].isin([10, 11, 12, 1, 2, 3])].copy()
+
+        # Shift October-December to the next year for bloom alignment
+        df_weather_filtered.loc[df_weather_filtered["month"].isin([10, 11, 12]), "year"] += 1
+
+        # Compute daily averages
+        df_daily_means = df_weather_filtered.groupby(["year", "DOY"]).agg({
+            "temperature_2m_max": "mean",
+            "temperature_2m_mean": "mean",
+            "temperature_2m_min": "mean",
+            "precipitation_sum": "mean",
+            "rain_sum": "mean"
+        }).reset_index()
+
+        # Compute count of cold days separately
+        df_cold_days = df_weather_filtered.groupby(["year", "DOY"])["temperature_2m_mean"].apply(lambda x: (x < 10).sum()).reset_index()
+        df_cold_days.rename(columns={"temperature_2m_mean": "cold_days_below_10"}, inplace=True)
+
+        # Compute temperature variability (std dev) for Nov-Jan per year-month
+        df_temp_variability = df_weather_filtered[df_weather_filtered["month"].isin([11, 12, 1, 2, 3])].groupby(["year", "month"]).agg({
+            "temperature_2m_mean": "std"
+        }).reset_index().rename(columns={"temperature_2m_mean": "temp_variability"})
+
+        # Feature 1: Growing Degree Days (GDD) - Base Temp 5°C (Jan-Mar)
+        df_weather_filtered["GDD"] = df_weather_filtered["temperature_2m_mean"].apply(lambda x: max(0, x - 5))
+        df_GDD = df_weather_filtered[df_weather_filtered["month"].isin([1, 2, 3])].groupby("year")["GDD"].sum().reset_index().rename(columns={"GDD": "total_GDD_Jan_Mar"})
+
+        # Feature 2: Warm Spell Detection (Days > 15°C in Feb-March)
+        df_weather_filtered["warm_spell_day"] = df_weather_filtered["temperature_2m_mean"] > 15
+        df_warm_spells = df_weather_filtered[df_weather_filtered["month"].isin([1, 2, 3])].groupby("year")["warm_spell_day"].sum().reset_index().rename(columns={"warm_spell_day": "total_warm_spells_Feb_Mar"})
+
+        # Feature 3: Temperature Trend (Mean & Std from Jan to March)
+        temp_trend = df_weather_filtered[df_weather_filtered["month"].isin([1, 2, 3])].groupby("year").agg({"temperature_2m_mean": ["mean", "std"]})
+        temp_trend.columns = ["temp_trend_mean", "temp_trend_std"]
+        temp_trend.reset_index(inplace=True)
+
+        # Merge cold day counts into daily means
+        df_daily_means = df_daily_means.merge(df_cold_days, on=["year", "DOY"], how="left")
+
+        # Ensure every (year, DOY) combination exists
+        all_years = df_weather_filtered["year"].unique()
+        valid_doys = df_weather_filtered["DOY"].unique()  # Only DOYs for Oct-Apr
+        all_doys = sorted(valid_doys)  # Sort to maintain order
+
+        full_doy_grid = pd.MultiIndex.from_product(
+            [all_years, all_doys],
+            names=["year", "DOY"]
+        ).to_frame(index=False)
+
+        # Merge to enforce a uniform structure
+        df_daily_means_full = full_doy_grid.merge(df_daily_means, on=["year", "DOY"], how="left")
+
+        # Fill missing values robustly
+        df_daily_means_full.interpolate(method="linear", inplace=True)  # Fill using trends
+        df_daily_means_full.fillna(df_daily_means_full.groupby("DOY").transform("median"), inplace=True)  # Use median where gaps exist
+        df_daily_means_full.fillna(0, inplace=True)  # Ensure no NaNs remain
+
+        # Add leap year column
+        df_daily_means_full["leap_year"] = df_daily_means_full["year"].apply(lambda x: 1 if (x % 4 == 0 and x % 100 != 0) or (x % 400 == 0) else 0)
+
+        # Pivot into a structured dataset (one row per year, columns per DOY)
+        df_pivot_doy = df_daily_means_full.pivot(index="year", columns="DOY", values=["temperature_2m_max", "temperature_2m_mean", "temperature_2m_min", "precipitation_sum", "rain_sum", "cold_days_below_10"])
+
+        # Flatten column names
+        df_pivot_doy.columns = [f"{var}_DOY{doy}" for var, doy in df_pivot_doy.columns]
+
+        # Reset index to keep "year" as a column
+        df_pivot_doy.reset_index(inplace=True)
+
+        # Add location column
+        df_pivot_doy["location"] = location_name
+
+        # Merge additional climate features
+        df_additional_features = df_GDD.merge(df_warm_spells, on="year").merge(temp_trend, on="year")
+        df_pivot_doy = df_pivot_doy.merge(df_additional_features, on="year", how="left")
+
+        # Merge temperature variability per year-month into the dataset
+        df_temp_variability_pivot = df_temp_variability.pivot(index="year", columns="month", values="temp_variability")
+        df_temp_variability_pivot.columns = [f"temp_variability_M{month}" for month in df_temp_variability_pivot.columns]
+
+        # Merge temperature variability into the final dataset
+        df_pivot_doy = df_pivot_doy.merge(df_temp_variability_pivot, on="year", how="left")
+
+        # Append to list
+        processed_data.append(df_pivot_doy)
+
+    # Concatenate all locations into a single dataframe
+    final_df = pd.concat(processed_data, ignore_index=True)
+
+    return final_df
+
+
+
+processed_weather_data = process_weather_data_with_advanced_features("weather/")
+```
+
+```{python}
+# Ensure only necessary columns exist
+df_training_march = df[['year', 'location', 'bloom_doy', 'alt', 'lat', 'long']].dropna()
+
+
+# Convert year to numeric
+df_training_march['year'] = pd.to_numeric(df_training_march['year'], errors='coerce')
+df_training_march['year_squared'] = df_training_march['year'] ** 2
+df_training_march['log_year'] = np.log(df_training_march['year'])
+df_training_march['year_lat'] = df_training_march['year'] * df_training_march['lat']
+
+
+# Sort data by location and year for< rolling calculations
+df_training_march = df_training_march.sort_values(by=['location', 'year'])
+
+# Compute rolling averages for bloom_doy within each location
+df_training_march['bloom_doy_lag1'] = df_training_march.groupby('location')['bloom_doy'].shift(1)  # Last year's bloom day
+df_training_march['bloom_doy_rolling2'] = df_training_march.groupby('location')['bloom_doy'].shift(1).rolling(window=2, min_periods=1).mean()
+df_training_march['bloom_doy_rolling3'] = df_training_march.groupby('location')['bloom_doy'].shift(1).rolling(window=3, min_periods=1).mean()  
+df_training_march['bloom_doy_rolling4'] = df_training_march.groupby('location')['bloom_doy'].shift(1).rolling(window=4, min_periods=1).mean()
+df_training_march['bloom_doy_rolling5'] = df_training_march.groupby('location')['bloom_doy'].shift(1).rolling(window=5, min_periods=1).mean()  
+df_training_march['bloom_doy_rolling7'] = df_training_march.groupby('location')['bloom_doy'].shift(1).rolling(window=7, min_periods=1).mean() 
+df_training_march['bloom_doy_rolling10'] = df_training_march.groupby('location')['bloom_doy'].shift(1).rolling(window=10, min_periods=1).mean() 
+df_training_march['alt_year'] = df_training_march['year']*df_training_march['alt']
+
+df_training_march = df_training_march[df_training_march['year']>= 2000]
+
+
+nyc_mask = (df_training_march['location'] == 'newyorkcity') & (df_training_march['year'] >= 2024)
+
+
+df_training_march.loc[nyc_mask, 'bloom_doy_lag1'] = df_training_march.loc[nyc_mask, 'bloom_doy']
+
+
+df_training_march.loc[nyc_mask, 'bloom_doy_rolling2'] =  df_training_march.loc[nyc_mask, 'bloom_doy']
+
+
+df_training_march.loc[nyc_mask, 'bloom_doy_rolling3'] =  df_training_march.loc[nyc_mask, 'bloom_doy']
+
+df_training_march.loc[nyc_mask, 'bloom_doy_rolling4'] =  df_training_march.loc[nyc_mask, 'bloom_doy']
+
+
+df_training_march.loc[nyc_mask, 'bloom_doy_rolling5'] =  df_training_march.loc[nyc_mask, 'bloom_doy']
+
+
+df_training_march.loc[nyc_mask, 'bloom_doy_rolling7'] = df_training_march.loc[nyc_mask, 'bloom_doy']
+
+
+df_training_march.loc[nyc_mask, 'bloom_doy_rolling10'] =  df_training_march.loc[nyc_mask, 'bloom_doy']
+# Merge the flower data with the weather data
+df_training_march = df_training_march.merge(processed_weather_data, on=["year", "location"], how="left")
+```
+
+# Genearte the feature importance based on a LGBM model
+
+```{python}
+# 1. Prepare the data
+# Create dummy variables for 'location' and filter for years < 2024
+df_training_dummies_march = pd.get_dummies(df_training_march, columns=['location'], drop_first=True).dropna()
+
+df_training_dummies_march['washington_year']= df_training_dummies_march['year']*df_training_dummies_march['log_year']
+
+df_training_dummies_march_filtered = df_training_dummies_march[df_training_dummies_march['year'] < 2024].dropna()
+
+# Separate features and target
+X = df_training_dummies_march_filtered.drop(columns=['bloom_doy'])
+y = df_training_dummies_march_filtered['bloom_doy']
+
+# 2. Optionally, scale numerical features
+
+scaler = StandardScaler()
+X_scaled_arr = scaler.fit_transform(X)
+# Convert back to DataFrame to retain column names
+X_scaled = pd.DataFrame(X_scaled_arr, columns=X.columns, index=X.index)
+
+# 3. Evaluate a LightGBM model using TimeSeriesSplit CV
+tscv = TimeSeriesSplit(n_splits=3)
+rmse_list = []
+
+print("Evaluating LightGBM model with TimeSeriesSplit:")
+for fold, (train_idx, test_idx) in enumerate(tscv.split(X_scaled), start=1):
+    X_train, X_test = X_scaled.iloc[train_idx], X_scaled.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    
+    # Define and train the LightGBM regressor
+    model = lgb.LGBMRegressor(random_state=42, verbosity = -1)
+    model.fit(X_train, y_train,
+              eval_set=[(X_test, y_test)])
+    
+    y_pred = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    rmse_list.append(rmse)
+    print(f"Fold {fold} RMSE: {rmse:.2f}")
+
+print(f"\nAverage RMSE from LightGBM (all features): {np.mean(rmse_list):.2f}\n")
+
+# 4. Train a final LightGBM model on all training data to extract feature importances
+final_model = lgb.LGBMRegressor(random_state=42, verbosity = -1)
+final_model.fit(X_scaled, y)
+feature_importances = final_model.feature_importances_
+
+
+feat_imp_df_march = pd.DataFrame({'feature': X_scaled.columns, 'importance': feature_importances})
+feat_imp_df_march = feat_imp_df_march.sort_values(by='importance', ascending=False)
+
+# 5. Select top N features 
+top_n = 128  # <-- Found trough trial and error 
+selected_features_march = feat_imp_df_march.head(top_n)['feature'].tolist()
+```
+
+# Model Tuning
+
+Here we tune the hyperparameters of our models. To generate reproducable results we already saved them. This process can also be quite time consuming. 
+
+```{python}
+# def tune_model_with_optuna(model_name: str,
+#                            X_train: np.ndarray, y_train: np.ndarray,
+#                            X_test: np.ndarray, y_test: np.ndarray,
+#                            n_trials: int = 50) -> dict:
+#     """
+#     Tune hyperparameters for a given model using Optuna with TimeSeriesSplit.
+#     Returns the best hyperparameters.
+#     """
+#     def objective(trial: optuna.Trial) -> float:
+#         if model_name == "SVR":
+#             params = {
+#                 "C": trial.suggest_float("C", 0.1, 1.0, log=True),
+#                 "epsilon": trial.suggest_float("epsilon", 0.01, 1.0),
+#                 "kernel": trial.suggest_categorical("kernel", ["linear"]),
+#             }
+#             model = SVR(**params)
+            
+#         elif model_name == "BayesianRidge":
+#             params = {
+#                 "alpha_1": trial.suggest_float("alpha_1", 1e-6, 1e-2, log=True),
+#                 "alpha_2": trial.suggest_float("alpha_2", 1e-6, 1e-2, log=True),
+#                 "lambda_1": trial.suggest_float("lambda_1", 1e-6, 1e-2, log=True),
+#                 "lambda_2": trial.suggest_float("lambda_2", 1e-6, 1e-2, log=True),
+#             }
+#             model = BayesianRidge(**params)
+            
+#         elif model_name == "LightGBM":
+#             params = {
+#                 "objective": "regression",
+#                 "metric": "rmse",
+#                 "verbosity": -1,
+#                 "boosting_type": "gbdt",
+#                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+#                 "num_leaves": trial.suggest_int("num_leaves", 20, 150),
+#                 "max_depth": trial.suggest_int("max_depth", 1, 20),
+#                 "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
+#                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10),
+#                 "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10),
+#                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0), 
+#                 "n_estimators": trial.suggest_int("n_estimators", 50, 600, step=25)
+#             }
+#             model = lgb.LGBMRegressor(**params)
+            
+#         elif model_name == "XGBoost":
+#             params = {
+#                 "n_estimators": trial.suggest_int("n_estimators", 250, 600, step=25),
+#                 "max_depth": trial.suggest_int("max_depth", 1, 20),
+#                 "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+#                 "gamma": trial.suggest_float("gamma", 0, 5),
+#                 "min_child_weight": trial.suggest_int("min_child_weight", 1, 30),
+#                 "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+#                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
+#                 "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 10, log=True),
+#                 "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 10, log=True)
+#             }
+#             model = xgb.XGBRegressor(**params)
+#         else:
+#             return float("inf")
+        
+#         # Train on the fixed training set and evaluate on the fixed test set.
+#         model.fit(X_train, y_train)
+#         y_pred = model.predict(X_test)
+#         rmse = np.sqrt(np.mean((y_test - y_pred) ** 2))
+#         return rmse
+
+#     study = optuna.create_study(direction="minimize")
+#     study.optimize(objective, n_trials=n_trials)
+#     return study.best_params
+
+
+# def tune_and_save_hyperparams(df_training: pd.DataFrame, selected_features: list, models_to_tune: list, n_trials: int = 50, save_path: str = "hyperparams_march.json") -> dict:
+#     """
+#     Tunes hyperparameters for each model in models_to_tune using time series cross-validation 
+#     and saves them to a JSON file.
+#     """
+    
+    
+#     # Split the data based on the "year" column
+#     train_df = df_training[df_training["year"] < 2023]
+#     test_df = df_training[df_training["year"] >= 2023]
+    
+#     # Select features and target variable
+#     X_train = train_df[selected_features]
+#     y_train = train_df["bloom_doy"]
+#     X_test = test_df[selected_features]
+#     y_test = test_df["bloom_doy"]
+    
+#     # Fit the scaler on training data and transform both sets
+#     scaler = StandardScaler()
+#     X_train_scaled = scaler.fit_transform(X_train)
+#     X_test_scaled = scaler.transform(X_test)
+    
+    
+#     hyperparams = {}
+#     for model_name in models_to_tune:
+#         print(f"Tuning {model_name}...")
+#         best_params = tune_model_with_optuna(model_name, X_train_scaled, y_train,
+#                                              X_test_scaled, y_test, n_trials)
+#         print(f"Best parameters for {model_name}: {best_params}")
+#         hyperparams[model_name] = best_params
+
+       
+
+#     # Save the hyperparameters to a JSON file
+    
+#     with open(save_path, "w") as f:
+#         json.dump(hyperparams, f)
+#     return hyperparams
+
+
+# # Example Usage:
+# models_to_tune = ["SVR", "BayesianRidge", "LightGBM", "XGBoost"]
+
+# # Assume df_training_dummies_filter is already defined and sorted by time
+# # And 'selected_features' is a list of features you wish to use
+# hyperparams = tune_and_save_hyperparams(df_training_dummies_march, selected_features_march, models_to_tune, n_trials=2500)
+```
+
+Check the predition accuracy for the years 2023 & 2024 
+
+```{python}
+# ---------------------------
+# 1. Load hyperparameters for each branch
+# ---------------------------
+with open("hyperparams_march.json", "r") as f:
+    hyperparams_march = json.load(f)
+
+
+# ---------------------------
+# 2. Prepare data and define target
+# ---------------------------
+df_training_prediction = df_training_dummies_march.copy()
+df_training_prediction = df_training_prediction.dropna()
+df_training_prediction = df_training_prediction[df_training_prediction['year']<2023]
+y = df_training_prediction["bloom_doy"]
+
+# ---------------------------
+# 3. Define base models (common types for both branches)
+# ---------------------------
+base_models_dict = {
+"SVR": SVR,
+"BayesianRidge": BayesianRidge,
+"LightGBM": lgb.LGBMRegressor,
+"XGBoost": xgb.XGBRegressor
+}
+
+# ---------------------------
+# 4. Build Feb ensemble
+# ---------------------------
+
+
+selected_features_march = feat_imp_df_march.head(128)['feature'].tolist()
+X_march= df_training_prediction[selected_features_march]
+scaler_march = StandardScaler()
+X_march_scaled = scaler_march.fit_transform(X_march)
+
+base_models_feb = {}
+predictions_list = []
+for model_name, model_class in base_models_dict.items():
+    params = hyperparams_march.get(model_name, {})
+    if model_name == "LightGBM":
+        params["verbosity"] = -1
+
+    model = model_class(**params)
+    model.fit(X_march_scaled, y)
+    X_test_scaled = scaler_march.transform(df_training_dummies_march[(df_training_dummies_march['year']>=2023)& (df_training_dummies_march['year']<=2024)][selected_features_march])
+    prediction = model.predict(X_test_scaled)
+    # print(model_name, prediction)
+    predictions_list.append(prediction)
+    rmse = (mean_absolute_error(df_training_dummies_march[(df_training_dummies_march['year']>=2023)& (df_training_dummies_march['year']<=2024)]['bloom_doy'], prediction))
+    print(model_name, rmse)
+
+
+ensemble_predictions = np.mean(np.vstack(predictions_list), axis=0)
+# print(ensemble_predictions)
+ensemble_mae = mean_absolute_error(df_training_dummies_march[(df_training_dummies_march['year']>=2023)& (df_training_dummies_march['year']<=2024)]['bloom_doy'], ensemble_predictions)
+print(f"\nEnsemble Average Prediction MAE : {ensemble_mae:.2f}")
+
+
+
+
+```
+
+```{python}
+import json
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.base import clone
+from sklearn.svm import SVR
+from sklearn.linear_model import BayesianRidge
+import lightgbm as lgb
+import xgboost as xgb
+
+def build_ensemble_and_predict_with_ci(
+    df_training_feb: pd.DataFrame,
+    df_training_march: pd.DataFrame,
+    selected_features_feb: list,
+    selected_features_march: list,
+    hyperparams_feb_file: str = "hyperparams_feb.json",
+    hyperparams_march_file: str = "hyperparams_march.json",
+    n_bootstrap: int = 1000
+) -> dict:
+    """
+    Trains two ensembles on all available training data using different feature sets:
+      - The Feb branch uses features available until February.
+      - The March branch uses features available until March.
+    
+    Both ensembles use their tuned hyperparameters (loaded from JSON files) and predict the target "bloom_doy"
+    using a set of base models. The final prediction is simply the average of the predictions from both branches.
+    
+    Bootstrapping is performed to estimate a 90% confidence interval on the final averaged prediction.
+    
+    Parameters:
+        df_training_feb (pd.DataFrame): Training dataset containing at least the target "bloom_doy", a "year" column,
+                                    and a "location" column.
+        df_training_march (pd.DataFrame): Training dataset containing at least the target "bloom_doy", a "year" column,
+                                    and a "location" column.
+        selected_features_feb (list): List of feature names available until February.
+        selected_features_march (list): List of feature names available until March.
+        hyperparams_feb_file (str): Path to the JSON file with tuned hyperparameters for the Feb base models.
+        hyperparams_march_file (str): Path to the JSON file with tuned hyperparameters for the March base models.
+        n_bootstrap (int): Number of bootstrap iterations for estimating prediction intervals.
+    
+    Returns:
+        dict: Contains:
+              - 'base_models_feb': dictionary of base models for February,
+              - 'base_models_march': dictionary of base models for March,
+              - 'scaler_feb' and 'scaler_march': scalers used for each branch,
+              - 'case_study': a dict with final averaged predictions and their 90% CI for the next year's data.
+              - hyperparameter dictionaries for reference.
+    """
+    # ---------------------------
+    # 1. Load hyperparameters for each branch
+    # ---------------------------
+    with open(hyperparams_feb_file, "r") as f:
+        hyperparams_feb = json.load(f)
+    with open(hyperparams_march_file, "r") as f:
+        hyperparams_march = json.load(f)
+    
+    # ---------------------------
+    # 2. Prepare data and define target
+    # ---------------------------
+    df_training_prediction = df_training_feb.copy().dropna()
+    df_training_prediction = df_training_prediction[df_training_prediction['year'] < 2025]
+    y = df_training_prediction["bloom_doy"]
+    
+    # ---------------------------
+    # 3. Define base models (common types for both branches)
+    # ---------------------------
+    base_models_dict = {
+        "SVR": SVR,
+        "BayesianRidge": BayesianRidge,
+        "LightGBM": lgb.LGBMRegressor,
+        "XGBoost": xgb.XGBRegressor
+    }
+    
+    # ---------------------------
+    # 4. Build Feb ensemble (without meta-model)
+    # ---------------------------
+
+    df_training_prediction = df_training_feb.copy().dropna()
+    df_training_prediction = df_training_prediction[df_training_prediction['year'] < 2025]
+    X_feb = df_training_prediction[selected_features_feb]
+
+    scaler_feb = StandardScaler()
+    X_feb_scaled = scaler_feb.fit_transform(X_feb)
+    
+    base_models_feb = {}
+    for model_name, model_class in base_models_dict.items():
+        params = hyperparams_feb.get(model_name, {})
+        if model_name == "LightGBM":
+            params["verbosity"] = -1
+        model = model_class(**params)
+        model.fit(X_feb_scaled, y)
+        base_models_feb[model_name] = model
+    
+    # ---------------------------
+    # 5. Build March ensemble (without meta-model)
+    # ---------------------------
+    df_training_prediction = df_training_march.copy().dropna()
+    df_training_prediction = df_training_prediction[df_training_prediction['year'] < 2025]
+    X_march = df_training_prediction[selected_features_march]
+    scaler_march = StandardScaler()
+    X_march_scaled = scaler_march.fit_transform(X_march)
+    
+    base_models_march = {}
+    for model_name, model_class in base_models_dict.items():
+        params = hyperparams_march.get(model_name, {})
+        if model_name == "LightGBM":
+            params["verbosity"] = -1
+        model = model_class(**params)
+        model.fit(X_march_scaled, y)
+        base_models_march[model_name] = model
+    
+    # ---------------------------
+    # 6. CASE STUDY: Predictions for Next Year (e.g., year 2025)
+    # ---------------------------
+    # 
+    df_case_feb = df_training_feb[df_training_feb["year"] == 2025].copy().dropna()
+    df_case_march = df_training_march[df_training_march["year"] == 2025].copy().dropna()
+    # Prepare case features for Feb and March branches
+    X_case_feb = scaler_feb.transform(df_case_feb[selected_features_feb])
+    X_case_march = scaler_march.transform(df_case_march[selected_features_march])
+    
+    # Generate predictions from each base model and average for each branch
+    preds_feb = np.column_stack([model.predict(X_case_feb) for model in base_models_feb.values()])
+    ensemble_pred_feb = np.mean(preds_feb, axis=1)
+    
+    preds_march = np.column_stack([model.predict(X_case_march) for model in base_models_march.values()])
+    ensemble_pred_march = np.mean(preds_march, axis=1)
+    
+    # Final prediction is the average of the Feb and March branch predictions
+    y_case_pred = 0.5 * (ensemble_pred_feb + ensemble_pred_march)
+    
+    # ---------------------------
+    # 7. Bootstrapping for 90% Confidence Intervals
+    # ---------------------------
+    boot_preds = []
+    rng = np.random.RandomState(42)
+    n_train_feb = X_feb_scaled.shape[0]
+    n_train_march = X_march_scaled.shape[0]
+    
+    for _ in range(n_bootstrap):
+        # Bootstrap sample for Feb branch
+        indices_feb = rng.choice(n_train_feb, size=n_train_feb, replace=True)
+        X_boot_feb = X_feb_scaled[indices_feb]
+        y_boot_feb = y.iloc[indices_feb] if hasattr(y, "iloc") else y[indices_feb]
+        boot_preds_feb = []
+        for model_name, model in base_models_feb.items():
+            model_boot = clone(model)
+            model_boot.fit(X_boot_feb, y_boot_feb)
+            boot_preds_feb.append(model_boot.predict(X_case_feb))
+        ensemble_boot_feb = np.mean(np.column_stack(boot_preds_feb), axis=1)
+        
+        # Bootstrap sample for March branch
+        indices_march = rng.choice(n_train_march, size=n_train_march, replace=True)
+        X_boot_march = X_march_scaled[indices_march]
+        y_boot_march = y.iloc[indices_march] if hasattr(y, "iloc") else y[indices_march]
+        boot_preds_march = []
+        for model_name, model in base_models_march.items():
+            model_boot = clone(model)
+            model_boot.fit(X_boot_march, y_boot_march)
+            boot_preds_march.append(model_boot.predict(X_case_march))
+        ensemble_boot_march = np.mean(np.column_stack(boot_preds_march), axis=1)
+        
+        # Combined bootstrap prediction: average of the two branch predictions
+        combined_boot_pred = 0.5 * (ensemble_boot_feb + ensemble_boot_march)
+        boot_preds.append(combined_boot_pred)
+    
+    boot_preds = np.array(boot_preds)  # shape: (n_bootstrap, n_case_samples)
+    ci_lower = np.percentile(boot_preds, 5, axis=0)
+    ci_upper = np.percentile(boot_preds, 95, axis=0)
+    
+    case_study_results = {
+        "predictions": y_case_pred,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper
+    }
+    
+    return {
+        "base_models_feb": base_models_feb,
+        "base_models_march": base_models_march,
+        "scaler_feb": scaler_feb,
+        "scaler_march": scaler_march,
+        "case_study": case_study_results,
+        "hyperparams_feb": hyperparams_feb,
+        "hyperparams_march": hyperparams_march
+    }
+
+# call:
+results = build_ensemble_and_predict_with_ci(
+    df_training_feb = df_training_dummies,
+    df_training_march = df_training_dummies_march,
+    selected_features_feb=selected_features,       # features for Feb branch
+    selected_features_march=selected_features_march, # features for March branch
+    hyperparams_feb_file="hyperparams_feb.json",
+    hyperparams_march_file="hyperparams_feb.json"
+)
+
+print("Case Study Predictions:", results["case_study"]["predictions"])
+print("90% CI Lower Bound:", results["case_study"]["ci_lower"])
+print("90% CI Upper Bound:", results["case_study"]["ci_upper"])
+```
+
+```{python}
+import csv
+
+
+prediction_output  = pd.DataFrame({'location':df_training[df_training['year']==2025]['location'].values , 'prediction': np.round(results['case_study']['predictions']).astype(int), 
+                                    'lower': np.round(results['case_study']['ci_lower']).astype(int), 'upper': np.round(results['case_study']['ci_upper']).astype(int)})
+
+desired_order = ["washingtondc", "liestal", "kyoto", "vancouver", "newyorkcity"]
+
+# Reorder the dataframe rows using the desired order
+df_ordered = prediction_output.set_index("location").reindex(desired_order).reset_index()
+
+df_ordered.to_csv('cherry-predictions.csv',index=False, quoting=csv.QUOTE_NONNUMERIC)
+```
+
+```{python}
+from datetime import datetime, timedelta
+
+def doy_to_date(year, doy):
+    # Subtract 1 because January 1st is day 1
+    return datetime(year, 1, 1) + timedelta(days=doy - 1)
+
+# Example:
+year = 2025
+df_ordered['date'] = pd.to_datetime(f"{year}-01-01") + pd.to_timedelta(df_ordered['prediction'] - 1, unit='d')
+print(df_ordered)
+```
+
+
+
+
