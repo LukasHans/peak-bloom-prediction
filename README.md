@@ -5,9 +5,10 @@ Beyond weather, our feature engineering extended to the creation of lag features
 To capture the complex, non-linear relationships inherent in the data, we constructed an ensemble of diverse models. Our ensemble combined four different approaches: Support Vector Regression (SVR), Bayesian Ridge Regression, XGBoost, and LightGBM. We designed two separate scenarios for model training. In the first scenario, we utilized data up to February, a period characterized by low uncertainty since these data points are fixed. In the second scenario, we incorporated March data as well, which introduces additional uncertainty due to the imputation process. For each model and scenario, hyperparameter tuning was performed using Optuna (Akiba et al., 2019)., a state-of-the-art optimization framework that efficiently explores high-dimensional hyperparameter spaces. Through iterative trial and error, we determined the optimal number of features by ranking the features based on their importance from a prior LightGBM model.
 Finally, we generated our predictions for the year 2025 by aggregating the outputs of the individual models within the ensemble. To quantify the uncertainty of our predictions, we applied a bootstrapping approach, which allowed us to compute confidence intervals for the ensemble prediction. The ensemble methodology not only improved overall prediction accuracy, as measured by the mean absolute error (MAE), but also enhanced the robustness of the prediction against model-specific biases.
 
-References 
+**References**
 
 •	Akiba, T., Sano, S., Yanase, T., Ohta, T., & Koyama, M. (2019). Optuna: A Next-generation Hyperparameter Optimization Framework. Proceedings of the 25th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, 2623–2631. https://doi.org/10.1145/3292500.3330701
+
 •	Reid, Philip & Hari, Renata & Beaugrand, Gregory & Livingstone, David & Marty, Christoph & Straile, Dietmar & Barichivich, Jonathan & Goberville, Eric & Adrian, Rita & Aono, Yasuyuki & Brown, Ross & Foster, James & Groisman, Pavel & Helaouet, Pierre & Hsu, Huang-Hsiung & Kirby, Richard & Knight, Jeff & Kraberg, Alexandra & Li, Jianping & Zhu, Zaichun. (2015). Global impacts of the 1980s regime shift. Global Change Biology. 22. 10.1111/gcb.13106. 
 
 
